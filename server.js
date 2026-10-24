@@ -6,6 +6,7 @@ const crypto = require('node:crypto')
 const http = require('node:http')
 const { WebSocketServer, WebSocket, createWebSocketStream } = require('ws')
 const contextUi = require('./context-ui')
+const { createWebCredentials } = require('./web-credentials')
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const digest = value => crypto.createHash('sha256').update(value).digest('hex')
@@ -50,6 +51,8 @@ function createGateway ({
     }
   }
   const agents = new Map(Object.entries(saved))
+  const webCredentials = createWebCredentials(dataDir)
+  let administratorLogins = 0
   const controls = new Map()
   const pending = new Map()
   const streams = new Map()
@@ -117,6 +120,8 @@ function createGateway ({
     if (!session || session.id !== id || session.expiresAt <= Date.now() ||
         agents.get(id)?.status !== 'approved') return
     if (session.scope === 'web' && session.passwordAuthenticated !== true) return
+    if (session.role === 'administrator' &&
+        webCredentials.metadata(id).revision !== session.credentialRevision) return
     if (session.scope === 'mcp' && (upgrade ||
         new URL(req.url, 'http://localhost').pathname !== '/mcp' ||
         !['GET', 'POST', 'DELETE'].includes(req.method))) return
@@ -128,6 +133,7 @@ function createGateway ({
     if (session?.scope === 'mcp') delete result.authorization
     const reserved = ['proxy-authorization', 'proxy-authenticate', 'x-anubis-managed-auth',
       'x-anubis-managed-session', 'x-anubis-managed-context',
+      'x-anubis-managed-role', 'x-anubis-web-role',
       'forwarded', 'x-forwarded-host', 'x-forwarded-for', 'x-forwarded-proto']
     for (const name of reserved) delete result[name]
     if (session?.scope === 'web') {
@@ -268,6 +274,7 @@ function createGateway ({
   async function contextControl (req, res, id) {
     const session = operator(req, id)
     if (!session || session.scope !== 'web') return json(res, 401, { error: 'Authenticated browser access required' })
+    if (session.role !== 'administrator') return json(res, 403, { error: 'Only the Web administrator may select Windows workspaces' })
     if (req.method !== 'GET' && req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' })
     try {
       if (req.method === 'GET') {
@@ -314,6 +321,8 @@ function createGateway ({
         sessions.delete(session.key)
         session.key = crypto.randomBytes(32).toString('hex')
         session.selector = result.selector
+        // The issued SYSTEM token cannot authenticate a different app profile.
+        delete session.profileToken
         session.context = context
         session.choiceId = input.id
         session.profileToken = undefined
@@ -345,8 +354,8 @@ function createGateway ({
     })
     res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in - Anubis-Security-Tool</title><style nonce="${nonce}">
 :root{color-scheme:dark;--main:#1e1e1e;--text:#e6e6e6;--border:#454545;--primary:#67b8e3}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--main);color:var(--text);font:14px system-ui,sans-serif}main{width:min(420px,calc(100% - 40px));padding:28px;border:1px solid var(--border);border-radius:10px}h1{font-size:20px;margin:0 0 12px}p{line-height:1.5;color:#bdbdbd}label,input,button{display:block;width:100%}input,button{font:inherit;padding:11px 12px;border:1px solid var(--border);border-radius:6px;margin-top:8px;background:var(--main);color:var(--text)}input:focus-visible,button:focus-visible{outline:2px solid var(--primary);outline-offset:2px}button{margin-top:18px;cursor:pointer;border-color:var(--primary)}button:disabled{opacity:.6;cursor:wait}#status{min-height:42px;color:var(--text)}
-</style></head><body><main><h1>Anubis-Security-Tool</h1><p>Sign in with this computer's workspace password. A device link does not grant access.</p><form id="login"><label for="password">Workspace password</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="4096" autofocus><button id="submit" type="submit">Sign in</button><p id="status" role="status" aria-live="polite"></p></form></main><script nonce="${nonce}">
-document.getElementById('login').addEventListener('submit',async event=>{event.preventDefault();const button=document.getElementById('submit');const password=document.getElementById('password');const status=document.getElementById('status');button.disabled=true;status.textContent='Signing in...';try{const response=await fetch('/_anubis/login',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({password:password.value}),signal:AbortSignal.timeout(45000)});password.value='';const result=await response.json();if(!response.ok)throw new Error(result.error||'Sign-in failed');window.location.replace('/')}catch(error){status.textContent=error.name==='TimeoutError'?'The computer did not respond. Try again.':error.message;button.disabled=false;password.focus()}})
+</style></head><body><main><h1>Anubis-Security-Tool</h1><p>Sign in to this device's separate SYSTEM Web workspace. This is not your Windows account or ordinary Desktop profile. A device link does not grant access.</p><form id="login"><label for="role">Web role</label><select id="role"><option value="user">User (device-local password)</option><option value="administrator">Administrator (configured in management panel)</option></select><label for="password">Web password</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="4096" autofocus><button id="submit" type="submit">Sign in</button><p id="status" role="status" aria-live="polite"></p></form></main><script nonce="${nonce}">
+document.getElementById('login').addEventListener('submit',async event=>{event.preventDefault();const button=document.getElementById('submit');const password=document.getElementById('password');const status=document.getElementById('status');button.disabled=true;status.textContent='Signing in...';try{const response=await fetch('/_anubis/login',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({role:document.getElementById('role').value,password:password.value}),signal:AbortSignal.timeout(45000)});password.value='';const result=await response.json();if(!response.ok)throw new Error(result.error||'Sign-in failed');window.location.replace('/')}catch(error){password.value='';status.textContent=error.name==='TimeoutError'?'The computer did not respond. Try again.':error.message;button.disabled=false;password.focus()}})
 </script></body></html>`)
     return true
   }
@@ -369,12 +378,25 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
     let stream
     try {
       const input = await body(req)
-      if (!input || Object.keys(input).join(',') !== 'password' ||
+      if (!input || Object.keys(input).some(key => !['password', 'role'].includes(key)) ||
+          (input.role !== undefined && !['user', 'administrator'].includes(input.role)) ||
           typeof input.password !== 'string' || !input.password || input.password.length > 4096) {
         return json(res, 400, { error: 'A workspace password is required' })
       }
+      const role = input.role || 'user'
+      const bindingId = crypto.randomBytes(32).toString('hex')
+      const expiresAt = Date.now() + (role === 'administrator' ? Math.min(sessionMs, 8 * 60 * 60 * 1000) : sessionMs)
+      let credentialRevision
+      if (role === 'administrator') {
+        if (administratorLogins >= 4) return json(res, 429, { error: 'Administrator sign-in is busy' })
+        administratorLogins++
+        try { credentialRevision = await webCredentials.verify(id, input.password) } finally { administratorLogins-- }
+        if (!credentialRevision) return json(res, 401, { error: 'Incorrect Web administrator password' })
+      }
       stream = await connect(id)
-      const payload = Buffer.from(JSON.stringify({ password: input.password }))
+      const payload = Buffer.from(JSON.stringify(role === 'administrator'
+        ? { role, bindingId, expiresAt }
+        : { password: input.password }))
       input.password = undefined
       let result
       try {
@@ -382,9 +404,14 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
           const upstream = http.request({
             hostname: 'managed.local',
             port: 80,
-            path: '/api/managed-password-login',
+            path: role === 'administrator' ? '/api/managed-role-login' : '/api/managed-password-login',
             method: 'POST',
-            headers: { 'content-type': 'application/json', 'content-length': payload.length, connection: 'close' },
+            headers: {
+              'content-type': 'application/json',
+              'content-length': payload.length,
+              connection: 'close',
+              ...(role === 'administrator' ? { 'x-anubis-managed-session': bindingId } : {})
+            },
             createConnection: () => stream
           }, response => {
             const chunks = []
@@ -413,11 +440,19 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
       if (result.status !== 200) {
         const status = [401, 409, 429].includes(result.status) ? result.status : 503
         const error = status === 409
-          ? 'Set a password for the SYSTEM workspace in the local desktop application before using Web access.'
-          : status === 401 ? 'Incorrect workspace password' : 'Workspace sign-in is unavailable. Try again.'
+          ? 'Device Web access is not provisioned; ask its local owner to check protected Web access setup.'
+          : status === 401
+            ? role === 'user' ? 'Incorrect User Web password' : 'Device role authorization was refused'
+            : 'Workspace sign-in is unavailable. Try again.'
         return json(res, status, { error })
       }
-      if (!/^[a-f0-9]{64}$/.test(result.value) || agents.get(id)?.status !== 'approved') {
+      const profileToken = role === 'administrator' ? result.value?.token : result.value
+      if (!/^[a-f0-9]{64}$/.test(profileToken) || agents.get(id)?.status !== 'approved' ||
+          expiresAt <= Date.now() ||
+          (role === 'administrator' && (Object.keys(result.value).sort().join(',') !== 'bindingId,expiresAt,role,token' ||
+            result.value.role !== role || result.value.bindingId !== bindingId ||
+            result.value.expiresAt !== expiresAt ||
+            webCredentials.metadata(id).revision !== credentialRevision))) {
         return json(res, 503, { error: 'Workspace sign-in is unavailable' })
       }
       const previous = operator(req, id)
@@ -427,10 +462,12 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
         id,
         key,
         scope: 'web',
+        role,
+        credentialRevision,
         passwordAuthenticated: true,
-        profileToken: result.value,
-        expiresAt: Date.now() + sessionMs,
-        bindingId: crypto.randomBytes(32).toString('hex'),
+        profileToken,
+        expiresAt,
+        bindingId,
         generation: 0,
         channels: new Set()
       }
@@ -446,7 +483,7 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
 
   async function proxy (req, res, id) {
     const session = operator(req, id)
-    if (!session) return json(res, 401, { error: 'Open this device from the administrator panel' })
+    if (!session) return json(res, 401, { error: 'Sign in with this device User or Administrator Web password' })
     const generation = session.generation
     let upstream
     try {
@@ -514,11 +551,14 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
         return loginPage(res)
       }
       let pathname
-      try { pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch {
+      try { pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '').toLowerCase() } catch {
         return json(res, 400, { error: 'Invalid managed path encoding' })
       }
       if (pathname === '/api/machine-contexts') {
         return json(res, 403, { error: 'Use the authenticated managed context controls' })
+      }
+      if (pathname === '/api/managed-role-login' || pathname === '/api/managed-password-login') {
+        return json(res, 403, { error: 'Private gateway sign-in endpoint' })
       }
       if (url.pathname === '/_anubis/contexts') return contextControl(req, res, id)
       if (['/_anubis/context-ui.js', '/_anubis/context-ui.css'].includes(url.pathname)) {
@@ -531,7 +571,7 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
           'cache-control': 'no-store',
           'x-content-type-options': 'nosniff'
         })
-        res.end(script ? contextUi.script : contextUi.style)
+        res.end(session.role !== 'administrator' ? '' : script ? contextUi.script : contextUi.style)
         return true
       }
       if (url.pathname === '/_anubis/connect' && req.method === 'POST') {
@@ -623,6 +663,33 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
       if (url.pathname === '/api/agents' && req.method === 'GET') {
         return json(res, 200, { agents: [...agents].map(([id, value]) => publicAgent(id, value)) })
       }
+      const credentialRoute = url.pathname.match(/^\/api\/agents\/([0-9a-f-]{36})\/web-admin(\/reveal)?$/)
+      if (credentialRoute) {
+        const [, agentId, reveal] = credentialRoute
+        const agent = agents.get(agentId)
+        if (!agent) return json(res, 404, { error: 'Device not found' })
+        if (reveal && req.method === 'POST') {
+          const input = await body(req)
+          if (Object.keys(input || {}).join(',') !== 'fingerprint' || input.fingerprint !== agent.fingerprint) {
+            return json(res, 409, { error: 'Device identity changed; reload before revealing' })
+          }
+          return json(res, 200, webCredentials.reveal(agentId))
+        }
+        if (!reveal && req.method === 'GET') return json(res, 200, webCredentials.metadata(agentId))
+        if (!reveal && req.method === 'POST') {
+          const input = await body(req)
+          if (!input || Object.keys(input).sort().join(',') !== 'expectedRevision,fingerprint,password' ||
+              input.fingerprint !== agent.fingerprint) return json(res, 409, { error: 'Device identity changed or invalid credential update' })
+          const result = await webCredentials.set(agentId, input.password, input.expectedRevision)
+          for (const [key, session] of sessions) {
+            if (session.id !== agentId || session.role !== 'administrator') continue
+            closeSessionChannels(session)
+            sessions.delete(key)
+          }
+          return json(res, 200, result)
+        }
+        return json(res, 405, { error: 'Method not allowed' })
+      }
       const match = url.pathname.match(/^\/api\/agents\/([0-9a-f-]{36})\/(approve|revoke|connect|mcp-token)$/)
       const agent = match && agents.get(match[1])
       if (!agent || req.method !== 'POST') return json(res, 404, { error: 'not found' })
@@ -667,6 +734,11 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
     }
     const id = hostId(req)
     if (id) {
+      let pathname
+      try { pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname).replace(/\/+$/, '').toLowerCase() } catch {
+        return reject(400)
+      }
+      if (['/api/machine-contexts', '/api/managed-role-login', '/api/managed-password-login'].includes(pathname)) return reject(403)
       const session = operator(req, id, true)
       if (!session) return reject(401)
       const generation = session.generation

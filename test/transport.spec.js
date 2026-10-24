@@ -31,6 +31,15 @@ async function fixture (t, options = {}) {
       res.end(JSON.stringify(status === 200 ? 'a'.repeat(64) : { error: 'Password required' }))
       return
     }
+    if (req.url === '/api/managed-role-login') {
+      const input = JSON.parse(Buffer.concat(chunks))
+      assert.equal(req.headers['x-anubis-managed-session'], input.bindingId)
+      assert.equal(req.headers['x-anubis-managed-auth'], 'private-local-only')
+      if (options.roleHandler) return options.roleHandler(req, res, input)
+      res.writeHead(options.roleStatus || 200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ...input, token: 'b'.repeat(64) }))
+      return
+    }
     if (req.url === '/api/machine-contexts' && options.contextHandler) {
       return options.contextHandler(req, res, Buffer.concat(chunks))
     }
@@ -123,7 +132,20 @@ async function fixture (t, options = {}) {
   return { dir, agent, gateway, server, base, states, api, browser, upstreamHeaders, localPort: upstream.address().port, setReady: value => { ready = value } }
 }
 
-async function browserSession (f) {
+const administratorPassword = 'R7!vL9@zC4#kT8$x'
+
+async function browserSession (f, role = 'user') {
+  if (role === 'administrator') {
+    const route = `/api/agents/${f.agent.id}/web-admin`
+    const metadata = await (await f.api(route)).json()
+    if (!metadata.configured) {
+      assert.equal((await f.api(route, 'POST', {
+        password: administratorPassword,
+        expectedRevision: metadata.revision,
+        fingerprint: f.agent.fingerprint
+      })).status, 200)
+    }
+  }
   const ticket = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
   const response = await f.browser('/_anubis/connect', {
     method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
@@ -132,7 +154,7 @@ async function browserSession (f) {
   const signedIn = await f.browser('/_anubis/login', {
     method: 'POST',
     headers: { origin: new URL(ticket.url).origin, 'content-type': 'application/json' },
-    body: JSON.stringify({ password: 'workspace-password' })
+    body: JSON.stringify({ role, password: role === 'administrator' ? administratorPassword : 'workspace-password' })
   })
   assert.equal(signedIn.status, 200)
   return { cookie: signedIn.headers['set-cookie'][0].split(';')[0], origin: new URL(ticket.url).origin }
@@ -150,7 +172,7 @@ test('device URLs and administrator tickets require a workspace password before 
   await approve(f)
   const page = await f.browser('/')
   assert.equal(page.status, 401)
-  assert.match(page.body.toString(), /Workspace password/)
+  assert.match(page.body.toString(), /Web password/)
   assert.match(page.headers['content-security-policy'], /frame-ancestors 'none'/)
   assert.equal(page.headers['cache-control'], 'no-store')
   const ticket = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
@@ -202,7 +224,7 @@ test('an unset workspace password cannot be used as an empty or passwordless gat
     body: JSON.stringify({ password: 'anything' })
   })
   assert.equal(result.status, 409)
-  assert.match(result.body.toString(), /Set a password/)
+  assert.match(result.body.toString(), /Device Web access is not provisioned/)
   assert.equal(result.headers['set-cookie'], undefined)
 })
 
@@ -220,6 +242,147 @@ test('password attempts are rate-limited per device and source address', async t
   }
 })
 
+test('per-device Web administrator credentials require management auth, explicit reveal and protected app issuance', async t => {
+  const f = await fixture(t)
+  await approve(f)
+  const route = `/api/agents/${f.agent.id}/web-admin`
+  assert.equal((await f.api(route, 'GET', undefined, false)).status, 401)
+  const metadata = await (await f.api(route)).json()
+  assert.equal(metadata.configured, false)
+  assert.equal((await f.api(route + '/reveal', 'POST', { fingerprint: f.agent.fingerprint })).status, 404)
+  assert.equal((await f.api(route, 'POST', {
+    fingerprint: '0'.repeat(64), password: administratorPassword, expectedRevision: 0
+  })).status, 409)
+  const session = await browserSession(f, 'administrator')
+  const reveal = await f.api(route + '/reveal', 'POST', { fingerprint: f.agent.fingerprint })
+  assert.equal(reveal.status, 200)
+  assert.equal(reveal.headers.get('cache-control'), 'no-store')
+  assert.equal((await reveal.json()).password, administratorPassword)
+  const listed = await (await f.api('/api/agents')).text()
+  assert.equal(listed.includes(administratorPassword), false)
+  const user = await browserSession(f)
+  const sockets = [session, user].map(value => new WebSocket(f.base.replace('http:', 'ws:') + '/socket', {
+    headers: { host: new URL(value.origin).host, cookie: value.cookie }
+  }))
+  t.after(() => sockets.forEach(socket => socket.terminate()))
+  await Promise.all(sockets.map(socket => new Promise((resolve, reject) => {
+    socket.once('open', resolve)
+    socket.once('error', reject)
+  })))
+  assert.equal((await f.browser('/_anubis/contexts', { cookie: user.cookie })).status, 403)
+  assert.equal((await f.browser('/api/managed-role-login', {
+    cookie: user.cookie, method: 'POST', body: '{}'
+  })).status, 403)
+  assert.equal((await f.browser('/api/managed-password-login', {
+    cookie: session.cookie, method: 'POST', body: '{}'
+  })).status, 403)
+  for (const route of ['/api/%6danaged-role-login/', '/API/MANAGED-PASSWORD-LOGIN', '/api%2Fmanaged-role-login']) {
+    const before = f.upstreamHeaders.length
+    assert.equal((await f.browser(route, {
+      cookie: user.cookie,
+      method: 'POST',
+      body: '{}',
+      headers: { 'x-anubis-managed-session': 'c'.repeat(64), 'x-anubis-managed-role': 'administrator' }
+    })).status, 403)
+    const status = await new Promise((resolve, reject) => {
+      const socket = new WebSocket(f.base.replace('http:', 'ws:') + route, {
+        headers: { host: new URL(session.origin).host, cookie: session.cookie }
+      })
+      socket.on('error', reject)
+      socket.once('unexpected-response', (_request, response) => {
+        resolve(response.statusCode)
+        response.resume()
+        socket.terminate()
+      })
+    })
+    assert.equal(status, 403)
+    assert.equal(f.upstreamHeaders.length, before, 'private adapter routes never reach a device for HTTP or WS')
+  }
+  const grant = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
+  const rotated = await f.api(route, 'POST', {
+    fingerprint: f.agent.fingerprint, password: 'T4!qJ8@xR2#vN7%z', expectedRevision: 1
+  })
+  assert.equal(rotated.status, 200)
+  await waitFor(() => sockets[0].readyState === WebSocket.CLOSED)
+  assert.equal(sockets[1].readyState, WebSocket.OPEN)
+  assert.equal((await f.browser('/api/get-constants', { cookie: session.cookie })).status, 401)
+  assert.equal((await f.browser('/api/get-constants', { cookie: user.cookie })).status, 200)
+  assert.equal((await f.browser('/mcp', { headers: { authorization: 'Bearer ' + grant.token } })).status, 200)
+  assert.equal((await (await f.api('/api/agents')).json()).agents[0].status, 'approved')
+})
+
+test('server administrator password alone never bypasses unavailable native role issuance', async t => {
+  const f = await fixture(t, { roleStatus: 501 })
+  await approve(f)
+  const route = `/api/agents/${f.agent.id}/web-admin`
+  assert.equal((await f.api(route, 'POST', {
+    password: administratorPassword, fingerprint: f.agent.fingerprint, expectedRevision: 0
+  })).status, 200)
+  const response = await f.browser('/_anubis/login', {
+    method: 'POST',
+    headers: { origin: `https://device-${f.agent.id.replace(/-/g, '')}.anubis.test`, 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'administrator', password: administratorPassword })
+  })
+
+  assert.equal(response.status, 503)
+  assert.equal(response.headers['set-cookie'], undefined)
+})
+
+test('native role response cannot replace its binding, role or expiration', async t => {
+  for (const field of ['bindingId', 'role', 'expiresAt']) {
+    await t.test(field, async t => {
+      const f = await fixture(t, {
+        roleHandler (_req, res, input) {
+          const changed = field === 'bindingId' ? 'c'.repeat(64) : field === 'role' ? 'user' : input.expiresAt + 1
+          res.setHeader('content-type', 'application/json')
+          res.end(JSON.stringify({ ...input, [field]: changed, token: 'b'.repeat(64) }))
+        }
+      })
+      await approve(f)
+      await f.api(`/api/agents/${f.agent.id}/web-admin`, 'POST', {
+        password: administratorPassword, fingerprint: f.agent.fingerprint, expectedRevision: 0
+      })
+      const response = await f.browser('/_anubis/login', {
+        method: 'POST',
+        headers: { origin: `https://device-${f.agent.id.replace(/-/g, '')}.anubis.test`, 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'administrator', password: administratorPassword })
+      })
+      assert.equal(response.status, 503)
+      assert.equal(response.headers['set-cookie'], undefined)
+    })
+  }
+})
+test('rotation while native administrator issuance is pending cannot create a stale authorized session', async t => {
+  let received
+  let release
+  const pending = new Promise(resolve => { received = resolve })
+  const held = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, {
+    async roleHandler (_req, res, input) {
+      received()
+      await held
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ ...input, token: 'b'.repeat(64) }))
+    }
+  })
+  t.after(() => release())
+  await approve(f)
+  const route = `/api/agents/${f.agent.id}/web-admin`
+  await f.api(route, 'POST', { password: administratorPassword, fingerprint: f.agent.fingerprint, expectedRevision: 0 })
+  const login = f.browser('/_anubis/login', {
+    method: 'POST',
+    headers: { origin: `https://device-${f.agent.id.replace(/-/g, '')}.anubis.test`, 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'administrator', password: administratorPassword })
+  })
+  await pending
+  assert.equal((await f.api(route, 'POST', {
+    password: 'L8!qH4@zP9#vR2$t', fingerprint: f.agent.fingerprint, expectedRevision: 1
+  })).status, 200)
+  release()
+  const response = await login
+  assert.equal(response.status, 503)
+  assert.equal(response.headers['set-cookie'], undefined)
+})
 test('Windows contexts bind to one browser, rotate cookies, close only its sockets and never expose selectors or spoofable headers', { timeout: 15000 }, async t => {
   const calls = []
   const contexts = [
@@ -242,8 +405,8 @@ test('Windows contexts bind to one browser, rotate cookies, close only its socke
     }
   })
   await approve(f)
-  const first = await browserSession(f)
-  const second = await browserSession(f)
+  const first = await browserSession(f, 'administrator')
+  const second = await browserSession(f, 'administrator')
   assert.equal((await f.browser('/_anubis/contexts')).status, 401)
   assert.equal((await f.browser('/api/machine-contexts', { cookie: first.cookie })).status, 403)
   assert.equal((await f.browser('/api/%6dachine-contexts/', { cookie: first.cookie })).status, 403)
@@ -300,6 +463,9 @@ test('Windows contexts bind to one browser, rotate cookies, close only its socke
   })
   assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], selector)
   assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-session'], binding)
+  assert.equal(f.upstreamHeaders.at(-1).token, undefined, 'SYSTEM role token is discarded on explicit profile selection')
+  await f.browser('/api/get-constants', { cookie: replacement, headers: { token: 'selected-profile-token' } })
+  assert.equal(f.upstreamHeaders.at(-1).token, 'selected-profile-token', 'selected profile login token is not overwritten')
   await f.browser('/', { cookie: second.cookie })
   assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], undefined)
   assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-session'], secondBinding)
@@ -327,7 +493,7 @@ test('context failures never change the browser cookie or silently switch its ex
     }
   })
   await approve(f)
-  const session = await browserSession(f)
+  const session = await browserSession(f, 'administrator')
   for (const code of [409, 200, 503]) {
     status = code
     const response = await f.browser('/_anubis/contexts', {

@@ -114,6 +114,75 @@ MCP response headers may take up to 130 seconds, accommodating the existing
 
 ## Windows contexts in a managed browser
 
+### Per-device Web roles (source integration contract)
+
+Web roles are Anubis access roles, not Windows accounts. Both start in the
+separate SYSTEM Web workspace; the ordinary Desktop user's profile is unchanged.
+User is the default sign-in choice and cannot list or select Windows workspaces.
+An explicitly authenticated Web administrator may use the existing policy-bound
+context chooser. Selecting a profile discards the issued SYSTEM profile token;
+the selected profile still requires its own application authentication.
+
+The management administrator can configure a device's Web administrator password
+using `GET /api/agents/:id/web-admin` and
+`POST /api/agents/:id/web-admin {fingerprint,password,expectedRevision}`.
+GET/POST return only `{configured,revision,updatedAt,role,workspace,userPasswordSource}`.
+Only explicit `POST /api/agents/:id/web-admin/reveal {fingerprint}` returns that
+Web password, with `Cache-Control: no-store`. The dashboard clears it after
+15 seconds, closing settings, stale identity/inventory or management sign-out.
+It does not retrieve Windows passwords, native profile passwords or user files.
+Rotation uses compare-and-set revision checks and closes this device's
+administrator Web sessions, not User sessions, enrollment or MCP grants.
+
+Passwords must be unique, at least 16 bytes, at most 1024 bytes, with upper/lower
+case, a number and a symbol; common/default patterns are refused. There is no
+universal administrator or user credential. `web-admin.json` stores a random-salt
+scrypt verifier (N=16384, r=8, p=1, 64-byte result) and AES-256-GCM ciphertext.
+`web-admin.key` is an independent random 32-byte server key. Device ID, revision,
+timestamp and verifier metadata are authenticated as GCM associated data.
+Key/store files are created exclusively with mode 0600; existing nonprivate
+POSIX modes, symlinks, missing keys, corruption and authenticated-data mismatch
+fail closed. Run one writer process under a protected server data directory.
+On Windows, provision a service-account/Administrators-only directory ACL
+separately: POSIX mode does not configure Windows ACLs. Back up key and store
+together through the existing private backup process; never commit either file.
+
+Device sign-in is same-origin
+`POST /_anubis/login {role:'user'|'administrator',password}`. Missing role means
+User for older clients. Approval, rate limits, expiry and revocation still apply.
+The gateway verifies the administrator password before calling the private
+loopback adapter, and limits concurrent administrator KDF operations to four.
+It never forwards the administrator password to a device.
+
+Required App adapter:
+
+* User: private `POST /api/managed-password-login {password}` verifies the
+  protected `<app.getPath('userData')>\\web-user-password.txt` locally on each
+  login and returns the existing 64-hex profile token only after protected
+  backend authorization. Generate a distinct initial password locally if
+  absent; local authorized edits take effect on the next login. No upload,
+  central plaintext user-password storage, Windows password reset or DPAPI
+  mutation is part of this protocol.
+* Administrator: private `POST /api/managed-role-login
+  {role:'administrator',bindingId:<64hex>,expiresAt:<integer>}` carries the
+  agent-injected transport proof **and** `x-anubis-managed-session: bindingId`.
+  App must reject missing/mismatched binding, nonadministrator role, expired
+  assertions and expiry more than eight hours ahead. Only after its protected
+  local authorization does it return exactly
+  `{token:<64hex>,bindingId,role:'administrator',expiresAt}`.
+* The gateway compares every response binding/role/expiry and the credential
+  revision again before issuing a host-only HttpOnly Secure cookie. Missing or
+  incompatible App support is an explicit failure, never passwordless fallback.
+  Both adapter routes are blocked for decoded/canonical public device paths,
+  including authenticated browsers. Browser-supplied managed-role/session
+  headers are stripped. Internal role/user RPC functions must not be callable
+  through ordinary browser RPC.
+
+The server/UI source contract alone is not proof that the local verifier,
+protected issuance or file-edit behavior is installed. Integrate and test the
+matching App adapter before release. No SDK version bump or publication is
+performed by this change. Project: https://github.com/Anubis-Security-Tool.
+
 A compatible Windows machine host can offer SYSTEM and policy-authorized
 interactive Windows sessions. This is not an application administrator/user role
 toggle, and standalone Web on Linux does not acquire Windows identities.

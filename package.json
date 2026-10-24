@@ -14,7 +14,8 @@
     "index.js",
     "client.js",
     "server.js",
-    "context-ui.js"
+    "context-ui.js",
+    "web-credentials.js"
   ],
   "scripts": {
     "test": "node --test test/*.spec.js"
