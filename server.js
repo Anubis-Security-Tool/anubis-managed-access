@@ -56,6 +56,7 @@ function createGateway ({
   const tickets = new Map()
   const sessions = new Map()
   const registrations = new Map()
+  const loginAttempts = new Map()
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 })
   let closed = false
 
@@ -115,6 +116,7 @@ function createGateway ({
     const session = bearer?.scope === 'mcp' ? bearer : sessions.get(key)
     if (!session || session.id !== id || session.expiresAt <= Date.now() ||
         agents.get(id)?.status !== 'approved') return
+    if (session.scope === 'web' && session.passwordAuthenticated !== true) return
     if (session.scope === 'mcp' && (upgrade ||
         new URL(req.url, 'http://localhost').pathname !== '/mcp' ||
         !['GET', 'POST', 'DELETE'].includes(req.method))) return
@@ -131,6 +133,9 @@ function createGateway ({
     if (session?.scope === 'web') {
       result['x-anubis-managed-session'] = session.bindingId
       if (session.selector) result['x-anubis-managed-context'] = session.selector
+      if (session.profileToken) {
+        result.token = session.profileToken
+      }
     }
     if (result.cookie) {
       result.cookie = result.cookie.split(';').filter(value =>
@@ -170,10 +175,12 @@ function createGateway ({
   }
 
   function request (req, stream, upgrade = false, session) {
+    const url = new URL(req.url, 'http://localhost')
+    if (session?.profileToken) url.searchParams.delete('token')
     return http.request({
       hostname: 'managed.local',
       port: 80,
-      path: req.url,
+      path: url.pathname + url.search,
       method: req.method,
       headers: headers(req, upgrade, session),
       createConnection: () => stream
@@ -309,6 +316,7 @@ function createGateway ({
         session.selector = result.selector
         session.context = context
         session.choiceId = input.id
+        session.profileToken = undefined
         sessions.set(session.key, session)
         res.setHeader('set-cookie', browserCookie(session))
         return json(res, 200, { ok: true, context })
@@ -324,6 +332,116 @@ function createGateway ({
   function browserCookie (session) {
     const seconds = Math.max(1, Math.floor((session.expiresAt - Date.now()) / 1000))
     return `__Host-anubis-gateway=${session.key}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${seconds}`
+  }
+
+  function loginPage (res) {
+    const nonce = crypto.randomBytes(18).toString('base64')
+    res.writeHead(401, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff',
+      'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`
+    })
+    res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in - Anubis-Security-Tool</title><style nonce="${nonce}">
+:root{color-scheme:dark;--main:#1e1e1e;--text:#e6e6e6;--border:#454545;--primary:#67b8e3}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--main);color:var(--text);font:14px system-ui,sans-serif}main{width:min(420px,calc(100% - 40px));padding:28px;border:1px solid var(--border);border-radius:10px}h1{font-size:20px;margin:0 0 12px}p{line-height:1.5;color:#bdbdbd}label,input,button{display:block;width:100%}input,button{font:inherit;padding:11px 12px;border:1px solid var(--border);border-radius:6px;margin-top:8px;background:var(--main);color:var(--text)}input:focus-visible,button:focus-visible{outline:2px solid var(--primary);outline-offset:2px}button{margin-top:18px;cursor:pointer;border-color:var(--primary)}button:disabled{opacity:.6;cursor:wait}#status{min-height:42px;color:var(--text)}
+</style></head><body><main><h1>Anubis-Security-Tool</h1><p>Sign in with this computer's workspace password. A device link does not grant access.</p><form id="login"><label for="password">Workspace password</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="4096" autofocus><button id="submit" type="submit">Sign in</button><p id="status" role="status" aria-live="polite"></p></form></main><script nonce="${nonce}">
+document.getElementById('login').addEventListener('submit',async event=>{event.preventDefault();const button=document.getElementById('submit');const password=document.getElementById('password');const status=document.getElementById('status');button.disabled=true;status.textContent='Signing in...';try{const response=await fetch('/_anubis/login',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({password:password.value}),signal:AbortSignal.timeout(45000)});password.value='';const result=await response.json();if(!response.ok)throw new Error(result.error||'Sign-in failed');window.location.replace('/')}catch(error){status.textContent=error.name==='TimeoutError'?'The computer did not respond. Try again.':error.message;button.disabled=false;password.focus()}})
+</script></body></html>`)
+    return true
+  }
+
+  async function passwordLogin (req, res, id) {
+    if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' })
+    if (req.headers.origin !== origin(id) ||
+        !/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
+      return json(res, 403, { error: 'Same-origin password sign-in required' })
+    }
+    if (agents.get(id)?.status !== 'approved') return json(res, 401, { error: 'Device access is not approved' })
+    const key = id + ':' + req.socket.remoteAddress
+    const now = Date.now()
+    for (const [key, value] of loginAttempts) if (value.until <= now) loginAttempts.delete(key)
+    const attempts = loginAttempts.get(key)
+    if (attempts?.count >= 10 || (!attempts && loginAttempts.size >= 1000)) {
+      return json(res, 429, { error: 'Too many sign-in attempts. Try again in a minute.' })
+    }
+    loginAttempts.set(key, { count: (attempts?.count || 0) + 1, until: attempts?.until || now + 60000 })
+    let stream
+    try {
+      const input = await body(req)
+      if (!input || Object.keys(input).join(',') !== 'password' ||
+          typeof input.password !== 'string' || !input.password || input.password.length > 4096) {
+        return json(res, 400, { error: 'A workspace password is required' })
+      }
+      stream = await connect(id)
+      const payload = Buffer.from(JSON.stringify({ password: input.password }))
+      input.password = undefined
+      let result
+      try {
+        result = await new Promise((resolve, reject) => {
+          const upstream = http.request({
+            hostname: 'managed.local',
+            port: 80,
+            path: '/api/managed-password-login',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'content-length': payload.length, connection: 'close' },
+            createConnection: () => stream
+          }, response => {
+            const chunks = []
+            let size = 0
+            response.on('data', bytes => {
+              size += bytes.length
+              if (size > 8192) return upstream.destroy(new Error('Invalid sign-in response'))
+              chunks.push(bytes)
+            })
+            response.once('error', reject)
+            response.once('end', () => {
+              try { resolve({ status: response.statusCode, value: JSON.parse(Buffer.concat(chunks).toString()) }) } catch {
+                reject(new Error('Invalid sign-in response'))
+              }
+            })
+          })
+          const timer = setTimeout(() => upstream.destroy(new Error('Password sign-in timed out')), 40000)
+          timer.unref?.()
+          upstream.once('close', () => clearTimeout(timer))
+          upstream.once('error', reject)
+          upstream.end(payload)
+        })
+      } finally {
+        payload.fill(0)
+      }
+      if (result.status !== 200) {
+        const status = [401, 409, 429].includes(result.status) ? result.status : 503
+        const error = status === 409
+          ? 'Set a password for the SYSTEM workspace in the local desktop application before using Web access.'
+          : status === 401 ? 'Incorrect workspace password' : 'Workspace sign-in is unavailable. Try again.'
+        return json(res, status, { error })
+      }
+      if (!/^[a-f0-9]{64}$/.test(result.value) || agents.get(id)?.status !== 'approved') {
+        return json(res, 503, { error: 'Workspace sign-in is unavailable' })
+      }
+      const previous = operator(req, id)
+      if (previous) { closeSessionChannels(previous); sessions.delete(previous.key) }
+      const key = crypto.randomBytes(32).toString('hex')
+      const session = {
+        id,
+        key,
+        scope: 'web',
+        passwordAuthenticated: true,
+        profileToken: result.value,
+        expiresAt: Date.now() + sessionMs,
+        bindingId: crypto.randomBytes(32).toString('hex'),
+        generation: 0,
+        channels: new Set()
+      }
+      sessions.set(key, session)
+      res.setHeader('set-cookie', browserCookie(session))
+      return json(res, 200, { ok: true })
+    } catch (error) {
+      return json(res, error.status || 503, { error: error.status ? error.message : 'Workspace sign-in is unavailable. Try again.' })
+    } finally {
+      stream?.destroy()
+    }
   }
 
   async function proxy (req, res, id) {
@@ -379,6 +497,22 @@ function createGateway ({
     const url = new URL(req.url, 'http://localhost')
     const id = hostId(req)
     if (id) {
+      if (url.pathname === '/_anubis/login') return passwordLogin(req, res, id)
+      if (url.pathname === '/_anubis/logout') {
+        if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' })
+        if (req.headers.origin !== origin(id)) return json(res, 403, { error: 'Same-origin sign-out required' })
+        const session = operator(req, id)
+        if (session?.scope === 'web') {
+          closeSessionChannels(session)
+          sessions.delete(session.key)
+        }
+        res.setHeader('set-cookie', '__Host-anubis-gateway=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0')
+        return json(res, 200, { ok: true })
+      }
+      if (['/', '/index.html'].includes(url.pathname) && req.method === 'GET' && !operator(req, id)) {
+        if (agents.get(id)?.status !== 'approved') return json(res, 401, { error: 'Device access is not approved' })
+        return loginPage(res)
+      }
       let pathname
       try { pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch {
         return json(res, 400, { error: 'Invalid managed path encoding' })
@@ -412,6 +546,7 @@ function createGateway ({
             id,
             key,
             scope: 'web',
+            passwordAuthenticated: false,
             expiresAt: Date.now() + sessionMs,
             bindingId: crypto.randomBytes(32).toString('hex'),
             generation: 0,

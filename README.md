@@ -43,8 +43,9 @@ credential. No key-rotation or credential-replacement endpoint is needed.
    supplied in the request, so the administrator must verify before approving.
 4. Wait for the new record to be approved and `online: true`, with the service's
    local readiness probe passing. Its device hostname changes with its new UUID.
-   Obtain fresh browser tickets or MCP grants for this new record; grants from
-   the legacy installation are not transferable.
+   Open its device URL and sign in with the new profile's workspace password.
+   Obtain fresh MCP grants when needed; grants from the legacy installation
+   are not transferable.
 5. Legacy approval, sessions and active channels remain unchanged. If retiring
    that access is separately authorized, an administrator can POST
    `/api/agents/:oldId/revoke`; revocation closes its active channels and
@@ -60,13 +61,42 @@ service profile must generate **both** values. Approval and scopes are never
 inherited from another record. Reuse the service's own identity file on restart;
 do not regenerate it each time.
 
-Operators authenticate separately to the controller. An approved, healthy agent
-can issue a short-lived, one-use browser ticket, exchanged by HTTPS POST for a
-host-only, HttpOnly, Secure, SameSite session cookie. Device hostnames are isolated
-as `device-<installation-UUID-without-hyphens>.anubis.locker`; wildcard DNS and TLS
-must be configured. Tickets and administrator credentials are not placed in URLs.
-The gateway strips its cookie and reserved headers before forwarding to the local
-application. Existing standalone Web user authentication remains in force.
+## Password-based browser access
+
+Device hostnames are isolated as
+`device-<installation-UUID-without-hyphens>.anubis.locker`; wildcard DNS and TLS
+must be configured. Open the approved device's URL directly and sign in with
+its **application workspace password**, not a Windows password or controller
+administrator token. The default machine workspace is SYSTEM.
+
+The gateway forwards a same-origin `POST /_anubis/login` password request through
+the authenticated device tunnel to `POST /api/managed-password-login`. Only the
+target application verifies the existing profile password. Passwords are not
+stored in the controller or included in URLs. An unset profile password returns
+409: configure it locally before using remote access. A bad password returns 401;
+the gateway limits sign-in attempts to ten per device/source address per minute,
+with an additional application-side limit.
+
+Successful login creates a host-only HttpOnly, Secure, SameSite=Strict cookie,
+valid for the configured `sessionMs` (eight hours by default). Reloading does not
+require another controller grant or change the cookie. The gateway binds traffic
+to the authenticated profile token and strips spoofed transport headers and stale
+query tokens. `POST /_anubis/logout` revokes that browser session, closes its
+channels and clears its cookie. The workspace bar and existing logout control
+both invoke this operation.
+
+Controller operators still authenticate separately for enrollment approval,
+inventory and MCP grants. Existing short-lived controller navigation tickets
+remain one-use, but **neither a device link nor a controller ticket authenticates
+the workspace**. Ticket exchange alone cannot open HTTP APIs or WebSockets.
+The gateway strips its cookie and reserved headers before forwarding.
+Standalone Web authentication remains separate and unchanged.
+
+Password sessions are held in memory: a gateway/application restart, password
+change, expiry or revocation can require signing in again. This implementation
+does not promise login persistence across process restarts. The updated desktop
+adapter is required; an older desktop without the password-login endpoint fails
+closed instead of falling back to passwordless access.
 
 For external MCP clients, an administrator can POST
 `/api/agents/:id/mcp-token` for an approved, online device. The response contains

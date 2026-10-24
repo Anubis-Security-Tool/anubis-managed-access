@@ -24,6 +24,13 @@ async function fixture (t, options = {}) {
     upstreamHeaders.push(req.headers)
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
+    if (req.url === '/api/managed-password-login') {
+      const password = JSON.parse(Buffer.concat(chunks)).password
+      const status = options.passwordUnset ? 409 : password === 'workspace-password' ? 200 : 401
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(status === 200 ? 'a'.repeat(64) : { error: 'Password required' }))
+      return
+    }
     if (req.url === '/api/machine-contexts' && options.contextHandler) {
       return options.contextHandler(req, res, Buffer.concat(chunks))
     }
@@ -122,7 +129,13 @@ async function browserSession (f) {
     method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
   })
   assert.equal(response.status, 200)
-  return { cookie: response.headers['set-cookie'][0].split(';')[0], origin: new URL(ticket.url).origin }
+  const signedIn = await f.browser('/_anubis/login', {
+    method: 'POST',
+    headers: { origin: new URL(ticket.url).origin, 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'workspace-password' })
+  })
+  assert.equal(signedIn.status, 200)
+  return { cookie: signedIn.headers['set-cookie'][0].split(';')[0], origin: new URL(ticket.url).origin }
 }
 
 async function approve (f) {
@@ -131,6 +144,81 @@ async function approve (f) {
   assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')).status, 200)
   await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
 }
+
+test('device URLs and administrator tickets require a workspace password before HTTP or WebSocket access', async t => {
+  const f = await fixture(t)
+  await approve(f)
+  const page = await f.browser('/')
+  assert.equal(page.status, 401)
+  assert.match(page.body.toString(), /Workspace password/)
+  assert.match(page.headers['content-security-policy'], /frame-ancestors 'none'/)
+  assert.equal(page.headers['cache-control'], 'no-store')
+  const ticket = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+  const exchanged = await f.browser('/_anubis/connect', { method: 'POST', body: JSON.stringify({ ticket: ticket.ticket }) })
+  const cookie = exchanged.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await f.browser('/api/get-constants', { cookie })).status, 401)
+  const login = (password, headers = {}) => f.browser('/_anubis/login', {
+    method: 'POST',
+    cookie,
+    headers: { origin: new URL(ticket.url).origin, 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ password })
+  })
+  assert.equal((await login('workspace-password', { origin: 'https://evil.test' })).status, 403)
+  assert.equal((await login('wrong')).status, 401)
+  assert.equal((await login('')).status, 400)
+  const success = await login('workspace-password')
+  assert.equal(success.status, 200)
+  assert.deepEqual(JSON.parse(success.body), { ok: true })
+  assert.equal(success.body.includes(Buffer.from('a'.repeat(64))), false)
+  const signedCookie = success.headers['set-cookie'][0].split(';')[0]
+  assert.notEqual(signedCookie, cookie)
+  assert.match(success.headers['set-cookie'][0], /HttpOnly; Secure; SameSite=Strict/)
+  const loaded = await f.browser('/api/get-constants?token=stale-profile', { cookie: signedCookie, headers: { token: 'forged-token' } })
+  assert.equal(loaded.status, 200)
+  assert.equal(f.upstreamHeaders.at(-1).token, 'a'.repeat(64))
+  assert.equal(loaded.headers['x-upstream-path'], '/api/get-constants')
+  assert.equal((await f.browser('/', { cookie: signedCookie })).status, 200)
+  const socket = new WebSocket(f.base.replace('http:', 'ws:') + '/socket?token=stale-profile', {
+    headers: { host: new URL(ticket.url).hostname, cookie: signedCookie, token: 'forged-token' }
+  })
+  t.after(() => socket.terminate())
+  await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
+  assert.equal(f.upstreamHeaders.at(-1).token, 'a'.repeat(64))
+  assert.equal((await f.browser('/api/get-constants', { cookie })).status, 401)
+  const logout = await f.browser('/_anubis/logout', {
+    method: 'POST', cookie: signedCookie, headers: { origin: new URL(ticket.url).origin }
+  })
+  assert.equal(logout.status, 200)
+  assert.match(logout.headers['set-cookie'][0], /Max-Age=0/)
+  assert.equal((await f.browser('/api/get-constants', { cookie: signedCookie })).status, 401)
+})
+
+test('an unset workspace password cannot be used as an empty or passwordless gateway login', async t => {
+  const f = await fixture(t, { passwordUnset: true })
+  await approve(f)
+  const result = await f.browser('/_anubis/login', {
+    method: 'POST',
+    headers: { origin: `https://device-${f.agent.id.replace(/-/g, '')}.anubis.test`, 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'anything' })
+  })
+  assert.equal(result.status, 409)
+  assert.match(result.body.toString(), /Set a password/)
+  assert.equal(result.headers['set-cookie'], undefined)
+})
+
+test('password attempts are rate-limited per device and source address', async t => {
+  const f = await fixture(t)
+  await approve(f)
+  for (let i = 0; i < 11; i++) {
+    const result = await f.browser('/_anubis/login', {
+      method: 'POST',
+      headers: { origin: `https://device-${f.agent.id.replace(/-/g, '')}.anubis.test`, 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'wrong' })
+    })
+    assert.equal(result.status, i < 10 ? 401 : 429)
+    assert.equal(result.headers['set-cookie'], undefined)
+  }
+})
 
 test('Windows contexts bind to one browser, rotate cookies, close only its sockets and never expose selectors or spoofable headers', { timeout: 15000 }, async t => {
   const calls = []
@@ -286,7 +374,8 @@ test('fresh service profile enrolls independently without inheriting or changing
   const exchanged = await f.browser('/_anubis/connect', {
     method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
   })
-  const cookie = exchanged.headers['set-cookie'][0].split(';')[0]
+  assert.equal(exchanged.status, 200)
+  const { cookie } = await browserSession(f)
   const mcp = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
   const socket = new WebSocket(f.base.replace('http:', 'ws:') + '/socket', {
     headers: { host: new URL(ticket.url).hostname, cookie }
@@ -374,7 +463,13 @@ test('fresh service profile enrolls independently without inheriting or changing
     method: 'POST', headers: serviceHost, body: JSON.stringify({ ticket: connection.ticket })
   })
   assert.equal(serviceExchange.status, 200)
-  const serviceCookie = serviceExchange.headers['set-cookie'][0].split(';')[0]
+  const serviceLogin = await f.browser('/_anubis/login', {
+    method: 'POST',
+    headers: { ...serviceHost, origin: new URL(connection.url).origin, 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'workspace-password' })
+  })
+  assert.equal(serviceLogin.status, 200)
+  const serviceCookie = serviceLogin.headers['set-cookie'][0].split(';')[0]
   assert.equal((await f.browser('/', { cookie: serviceCookie, headers: serviceHost })).status, 200)
   assert.equal((await f.browser('/', { cookie })).status, 200)
   assert.equal((await f.browser('/mcp', { headers: { authorization: 'Bearer ' + mcp.token } })).status, 200)
@@ -414,7 +509,7 @@ test('real enrolled transport requires approval, streams HTTP and WebSocket, and
   assert.equal(exchanged.status, 200)
   const setCookie = exchanged.headers['set-cookie'][0]
   assert.match(setCookie, /HttpOnly; Secure; SameSite=Strict/)
-  const cookie = setCookie.split(';')[0]
+  const { cookie } = await browserSession(f)
   assert.equal((await f.browser('/_anubis/connect', { method: 'POST', body: JSON.stringify({ ticket: issued.ticket }) })).status, 401)
   const response = await f.browser('/real/path?value=1', { cookie, headers: { 'x-anubis-managed-auth': 'spoofed' } })
   assert.equal(response.status, 200)
@@ -521,7 +616,8 @@ test('MCP synchronous operations can respond beyond the ordinary 30-second Web h
   const issued = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
   const connection = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
   const exchanged = await f.browser('/_anubis/connect', { method: 'POST', body: JSON.stringify({ ticket: connection.ticket }) })
-  const cookie = exchanged.headers['set-cookie'][0].split(';')[0]
+  assert.equal(exchanged.status, 200)
+  const { cookie } = await browserSession(f)
   const started = Date.now()
   const responses = await Promise.all([
     { headers: { authorization: 'Bearer ' + issued.token } },

@@ -20,11 +20,31 @@ function contextUi () {
   refresh.textContent = 'Refresh'
   const status = document.createElement('span')
   status.setAttribute('role', 'status')
-  bar.append(label, refresh, status)
+  const signOut = document.createElement('button')
+  signOut.textContent = 'Sign out'
+  signOut.id = 'anubis-sign-out'
+  bar.append(label, refresh, status, signOut)
   document.body.prepend(bar)
   document.body.classList.add('anubis-managed-contexts')
   let currentId = ''
   let changing = false
+  document.addEventListener('click', async event => {
+    if (!event.target.closest?.('#anubis-sign-out, .logout-icon')) return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    signOut.disabled = true
+    try {
+      const response = await fetch('/_anubis/logout', {
+        method: 'POST', credentials: 'same-origin', signal: AbortSignal.timeout(10000)
+      })
+      if (!response.ok) throw new Error('Sign-out failed')
+      window.localStorage.removeItem('tokenElecterm')
+      window.location.replace('/')
+    } catch (error) {
+      status.textContent = error.message
+      signOut.disabled = false
+    }
+  }, true)
   async function request (method = 'GET', payload) {
     const response = await fetch('/_anubis/contexts', {
       method,
@@ -108,10 +128,22 @@ module.exports = {
 #anubis-context-controls {
   position: fixed; inset: 0 0 auto 0; z-index: 10000; min-height: 42px;
   display: flex; align-items: center; gap: 10px; padding: 6px 10px;
-  box-sizing: border-box; color: #e6edf3; background: #17191d;
-  border-bottom: 1px solid #475366; font: 12px system-ui, sans-serif;
+  box-sizing: border-box; color: var(--text, #e6edf3); background: var(--main, #17191d);
+  border-bottom: 1px solid var(--border, var(--ui-border, #475366)); font: 12px system-ui, sans-serif;
 }
 #anubis-context-controls select { max-width: 48vw; }
+#anubis-context-controls select, #anubis-context-controls button {
+  color: inherit; background: var(--main, #17191d);
+  border: 1px solid var(--border, var(--ui-border, #475366));
+  border-radius: 6px; font: inherit; padding: 4px 8px;
+}
+#anubis-context-controls button:hover:not(:disabled) { background: var(--main-light, #252a32); }
+#anubis-context-controls select:focus-visible, #anubis-context-controls button:focus-visible {
+  outline: 2px solid var(--primary, #22d3ee); outline-offset: 2px;
+}
+#anubis-context-controls select:disabled, #anubis-context-controls button:disabled {
+  color: var(--text-disabled, #94a3b8); cursor: not-allowed;
+}
 #anubis-context-controls [role="status"] { overflow-wrap: anywhere; }
 body.anubis-managed-contexts #container { margin-top: 54px; height: calc(100vh - 54px); }
 @media (max-width: 700px) {
