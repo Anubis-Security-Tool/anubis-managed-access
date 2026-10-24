@@ -193,6 +193,10 @@ test('device URLs and administrator tickets require a workspace password before 
   assert.deepEqual(JSON.parse(success.body), { ok: true })
   assert.equal(success.body.includes(Buffer.from('a'.repeat(64))), false)
   const signedCookie = success.headers['set-cookie'][0].split(';')[0]
+  const userScript = await f.browser('/_anubis/context-ui.js', { cookie: signedCookie })
+  assert.equal(userScript.status, 200)
+  assert.match(userScript.body.toString(), /_anubis\/logout/)
+  assert.doesNotMatch(userScript.body.toString(), /anubis-context-controls|_anubis\/contexts/)
   assert.notEqual(signedCookie, cookie)
   assert.match(success.headers['set-cookie'][0], /HttpOnly; Secure; SameSite=Strict/)
   const loaded = await f.browser('/api/get-constants?token=stale-profile', { cookie: signedCookie, headers: { token: 'forged-token' } })

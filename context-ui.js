@@ -1,5 +1,30 @@
 'use strict'
 
+function userUi () {
+  let signingOut = false
+  document.addEventListener('click', async event => {
+    if (!event.target.closest?.('.logout-icon')) return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    if (signingOut) return
+    signingOut = true
+    try {
+      const response = await fetch('/_anubis/logout', {
+        method: 'POST', credentials: 'same-origin', signal: AbortSignal.timeout(10000)
+      })
+      if (!response.ok) throw new Error('Sign-out failed')
+      window.localStorage.removeItem('tokenElecterm')
+      window.location.replace('/')
+    } catch {
+      const message = document.createElement('div')
+      message.setAttribute('role', 'alert')
+      message.textContent = 'Unable to sign out. Check the connection and try again.'
+      document.body.prepend(message)
+      signingOut = false
+    }
+  }, true)
+}
+
 function contextUi () {
   if (document.getElementById('anubis-context-controls')) return
   const link = document.createElement('link')
@@ -123,6 +148,7 @@ function contextUi () {
 }
 
 module.exports = {
+  userScript: '(' + userUi.toString() + ')();',
   script: '(' + contextUi.toString() + ')();',
   style: `
 #anubis-context-controls {
