@@ -1,9 +1,17 @@
 {
   "name": "@ai-security-tool/managed-access",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Authenticated Anubis managed instance enrollment and reverse Web transport",
   "main": "index.js",
   "license": "MIT",
+  "homepage": "https://github.com/Anubis-Security-Tool/anubis-managed-access#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Anubis-Security-Tool/anubis-managed-access.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Anubis-Security-Tool/anubis-managed-access/issues"
+  },
   "publishConfig": {
     "registry": "https://npm.anubis.locker/"
   },

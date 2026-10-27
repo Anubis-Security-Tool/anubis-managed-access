@@ -1,12 +1,39 @@
-# Anubis managed access
+# 🔗 Anubis managed access
 
 Shared managed-instance client and reverse Web gateway for Anubis-Security-Tool.
 The client initiates outbound TLS connections; no public listener or firewall
 opening is required on the managed PC. HTTP bodies and WebSocket streams travel
 over authenticated per-request binary channels, including file transfers.
 
+[Website](https://anubis.locker) · [Desktop](https://github.com/Anubis-Security-Tool/anubis) · [Web](https://github.com/Anubis-Security-Tool/anubis-web) · [Product Wiki](https://github.com/Anubis-Security-Tool/anubis/wiki)
+
+This README describes the source in this repository, not a guarantee that an
+installed desktop or Web release includes every capability described here.
+Confirm the installed version and host support before relying on a feature.
+The canonical product Wiki belongs to the desktop repository linked above;
+linking to it does not mean that its pages have been initialized or published.
+
+Enrollment, administrator approval, browser access and profile authentication are
+separate boundaries. This transport does not reset Windows or application
+passwords and does not turn SYSTEM/session 0 into an interactive desktop.
+
 `createAgent` is exported from the package root; `createGateway` is exported from
 `@ai-security-tool/managed-access/server`. Node 20 or newer is required.
+
+## Package release
+
+Version **1.0.4** includes workspace-password browser login, encrypted per-device
+Web administrator roles, protected role issuance and User sign-out even on hosts
+without Windows context controls. It preserves the functional source through
+`eb0cfa015fadad018589f5060b99d749a586c598`; the earlier published `1.0.3`
+does not identify this complete source revision.
+
+After coordinated publication, Desktop and Web source installs must pin
+`@ai-security-tool/managed-access` to `1.0.4` and update their lockfiles using
+`https://npm.anubis.locker/`. Publishing this SDK alone does not update those
+consumers or deploy a controller. Validate the package contents with
+`npm pack --dry-run` before publishing; the package includes `context-ui.js`
+and `web-credentials.js` as well as the client and gateway.
 
 An installation persists a random UUID and 256-bit credential in its private
 profile. The controller stores only its SHA-256 fingerprint. First enrollment is
@@ -180,8 +207,9 @@ Required App adapter:
 
 The server/UI source contract alone is not proof that the local verifier,
 protected issuance or file-edit behavior is installed. Integrate and test the
-matching App adapter before release. No SDK version bump or publication is
-performed by this change. Project: https://github.com/Anubis-Security-Tool.
+matching App adapter before release. Preparing SDK 1.0.4 does not itself publish
+the package or install its matching App adapter.
+Project: https://github.com/Anubis-Security-Tool/anubis-managed-access.
 
 A compatible Windows machine host can offer SYSTEM and policy-authorized
 interactive Windows sessions. This is not an application administrator/user role
@@ -227,3 +255,9 @@ WebSocket echo, readiness, credential collision and revocation checks. Migration
 coverage uses synthetic user/service identities on the same loopback gateway,
 verifies independent approval and grants, and preserves the legacy profile,
 record and live transport. Tests do not alter a production controller.
+
+## License
+
+MIT License. Copyright (c) 2026 Anubis-Locker. See [LICENSE](LICENSE) for the
+complete terms; retain its copyright and permission notice in copies or
+substantial portions of the software.
