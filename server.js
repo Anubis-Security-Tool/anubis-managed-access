@@ -119,7 +119,10 @@ function createGateway ({
     const session = bearer?.scope === 'mcp' ? bearer : sessions.get(key)
     if (!session || session.id !== id || session.expiresAt <= Date.now() ||
         agents.get(id)?.status !== 'approved') return
-    if (session.scope === 'web' && session.passwordAuthenticated !== true) return
+    if (session.scope === 'web') {
+      if (!!session.standaloneWeb !== (agents.get(id).app === 'anubis-web')) return
+      if (!session.standaloneWeb && session.passwordAuthenticated !== true) return
+    }
     if (session.role === 'administrator' &&
         webCredentials.metadata(id).revision !== session.credentialRevision) return
     if (session.scope === 'mcp' && (upgrade ||
@@ -534,7 +537,11 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
     const url = new URL(req.url, 'http://localhost')
     const id = hostId(req)
     if (id) {
-      if (url.pathname === '/_anubis/login') return passwordLogin(req, res, id)
+      const standaloneWeb = agents.get(id)?.app === 'anubis-web'
+      if (url.pathname === '/_anubis/login') {
+        if (standaloneWeb) return json(res, 409, { error: 'Open an approved connection link, then sign in through the standalone Web application' })
+        return passwordLogin(req, res, id)
+      }
       if (url.pathname === '/_anubis/logout') {
         if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' })
         if (req.headers.origin !== origin(id)) return json(res, 403, { error: 'Same-origin sign-out required' })
@@ -548,6 +555,7 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
       }
       if (['/', '/index.html'].includes(url.pathname) && req.method === 'GET' && !operator(req, id)) {
         if (agents.get(id)?.status !== 'approved') return json(res, 401, { error: 'Device access is not approved' })
+        if (standaloneWeb) return json(res, 401, { error: 'Open an approved connection link, then sign in with the standalone Web application password' })
         return loginPage(res)
       }
       let pathname
@@ -580,12 +588,14 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
           const ticket = tickets.get(input.ticket)
           tickets.delete(input.ticket)
           if (!ticket || ticket.id !== id || ticket.expiresAt <= Date.now() ||
+              ticket.standaloneWeb !== standaloneWeb ||
               agents.get(id)?.status !== 'approved') return json(res, 401, { error: 'Invalid or expired connection ticket' })
           const key = crypto.randomBytes(32).toString('hex')
           const session = {
             id,
             key,
             scope: 'web',
+            standaloneWeb,
             passwordAuthenticated: false,
             expiresAt: Date.now() + sessionMs,
             bindingId: crypto.randomBytes(32).toString('hex'),
@@ -704,7 +714,7 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
       if (action === 'connect') {
         if (!publicAgent(agentId, agent).online) return json(res, 503, { error: 'Managed endpoint is not online' })
         const ticket = crypto.randomBytes(32).toString('hex')
-        tickets.set(ticket, { id: agentId, expiresAt: Date.now() + 30000 })
+        tickets.set(ticket, { id: agentId, standaloneWeb: agent.app === 'anubis-web', expiresAt: Date.now() + 30000 })
         return json(res, 200, { url: origin(agentId), ticket, expiresAt: Date.now() + 30000 })
       }
       const previous = agent.status

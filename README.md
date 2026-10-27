@@ -24,7 +24,8 @@ passwords and does not turn SYSTEM/session 0 into an interactive desktop.
 
 Version **1.0.4** includes workspace-password browser login, encrypted per-device
 Web administrator roles, protected role issuance and User sign-out even on hosts
-without Windows context controls. It preserves the functional source through
+without Windows context controls. It also preserves standalone Web's separate
+navigation-grant and application-JWT contract. It preserves the functional source through
 `eb0cfa015fadad018589f5060b99d749a586c598`; the earlier published `1.0.3`
 does not identify this complete source revision.
 
@@ -88,7 +89,7 @@ service profile must generate **both** values. Approval and scopes are never
 inherited from another record. Reuse the service's own identity file on restart;
 do not regenerate it each time.
 
-## Password-based browser access
+## Desktop password-based browser access
 
 Device hostnames are isolated as
 `device-<installation-UUID-without-hyphens>.anubis.locker`; wildcard DNS and TLS
@@ -210,6 +211,28 @@ protected issuance or file-edit behavior is installed. Integrate and test the
 matching App adapter before release. Preparing SDK 1.0.4 does not itself publish
 the package or install its matching App adapter.
 Project: https://github.com/Anubis-Security-Tool/anubis-managed-access.
+
+### Standalone Web compatibility
+
+The exact enrolled application kind `anubis-web` retains its independent Web
+authentication contract. An administrator first approves the installation and
+issues a one-use connection ticket using `POST /api/agents/:id/connect`.
+Exchanging it at the device's `POST /_anubis/connect` grants only gateway
+transport access through the secure browser cookie. The Web application still
+requires its own `POST /api/login` password check and JWT for protected HTTP
+and WebSocket routes. A JWT without the gateway cookie is not sufficient.
+
+The gateway preserves that application's HTTP `token` header and WebSocket
+`token` query parameter; it does not mint, replace or verify the Web JWT and
+does not call the Desktop-only password or role adapters. Use the standalone
+Web sign-in page after opening the approved connection link, not
+`/_anubis/login`. Ticket and session admission remain bound to the enrolled
+application kind, approval, expiry and revocation. Unknown application kinds
+do not receive this compatibility path.
+
+The Desktop password and User/Administrator role protocol above remains
+unchanged. Neither a Desktop connection ticket nor a browser-supplied
+application label bypasses its protected local password/role authorization.
 
 A compatible Windows machine host can offer SYSTEM and policy-authorized
 interactive Windows sessions. This is not an application administrator/user role

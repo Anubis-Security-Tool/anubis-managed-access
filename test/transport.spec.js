@@ -24,6 +24,7 @@ async function fixture (t, options = {}) {
     upstreamHeaders.push(req.headers)
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
+    if (options.upstreamHandler) return options.upstreamHandler(req, res, Buffer.concat(chunks))
     if (req.url === '/api/managed-password-login') {
       const password = JSON.parse(Buffer.concat(chunks)).password
       const status = options.passwordUnset ? 409 : password === 'workspace-password' ? 200 : 401
@@ -52,7 +53,7 @@ async function fixture (t, options = {}) {
     res.writeHead(200, { 'content-type': 'application/octet-stream', 'x-upstream-path': req.url })
     res.end(chunks.length ? Buffer.concat(chunks) : 'managed real HTTP response')
   })
-  const echo = new WebSocketServer({ server: upstream })
+  const echo = new WebSocketServer({ server: upstream, verifyClient: options.verifyWebSocket })
   echo.on('connection', (ws, req) => {
     upstreamHeaders.push(req.headers)
     ws.on('message', value => ws.send(value))
@@ -80,6 +81,7 @@ async function fixture (t, options = {}) {
   let ready = true
   const agent = createAgent({
     baseUrl: base,
+    app: options.app,
     identityFile: path.join(dir, 'client.json'),
     localPort: upstream.address().port,
     localHeaders: { 'x-anubis-managed-auth': 'private-local-only' },
@@ -166,6 +168,184 @@ async function approve (f) {
   assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')).status, 200)
   await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
 }
+
+test('standalone Web preserves approved navigation grant plus independently verified application JWT over HTTP and WebSocket', async t => {
+  const key = crypto.randomBytes(32)
+  const paths = []
+  const socketChecks = []
+  let jwt
+  function sign (claims) {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
+    const payload = Buffer.from(JSON.stringify(claims)).toString('base64url')
+    const input = header + '.' + payload
+    return input + '.' + crypto.createHmac('sha256', key).update(input).digest('base64url')
+  }
+  function authorized (req) {
+    const token = req.headers.token || new URL(req.url, 'http://localhost').searchParams.get('token')
+    if (typeof token !== 'string') return false
+    const parts = token.split('.')
+    if (parts.length !== 3) return false
+    const signature = crypto.createHmac('sha256', key).update(parts.slice(0, 2).join('.')).digest('base64url')
+    if (signature !== parts[2]) return false
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url'))
+    return claims.exp > Date.now() / 1000 && claims.user === 'standalone-fixture'
+  }
+  const f = await fixture(t, {
+    app: 'anubis-web',
+    upstreamHandler (req, res, bytes) {
+      paths.push(req.url)
+      res.setHeader('content-type', 'application/json')
+      if (req.url === '/') return res.end(JSON.stringify({ page: 'standalone Web login' }))
+      if (req.url === '/api/login' && req.method === 'POST') {
+        if (JSON.parse(bytes).password !== 'independent-web-password') {
+          res.writeHead(401)
+          return res.end(JSON.stringify({ error: 'Invalid standalone password' }))
+        }
+        jwt = sign({ user: 'standalone-fixture', exp: Math.floor(Date.now() / 1000) + 60 })
+        res.setHeader('content-type', 'text/plain')
+        return res.end(jwt)
+      }
+      if (!authorized(req)) {
+        res.writeHead(401)
+        return res.end(JSON.stringify({ error: 'Independent Web JWT required' }))
+      }
+      res.end(JSON.stringify({ authenticated: true }))
+    },
+    verifyWebSocket: info => {
+      const valid = authorized(info.req)
+      socketChecks.push(valid)
+      return valid
+    }
+  })
+  await approve(f)
+  assert.equal((await f.browser('/')).status, 401)
+  assert.equal((await f.browser('/api/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'independent-web-password' })
+  })).status, 401)
+  assert.equal(paths.length, 0)
+  const ticket = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+  const response = await f.browser('/_anubis/connect', {
+    method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
+  })
+  const cookie = response.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await f.browser('/_anubis/connect', {
+    method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
+  })).status, 401)
+  const page = await f.browser('/', { cookie })
+  assert.equal(page.status, 200)
+  assert.match(page.body.toString(), /standalone Web login/)
+  assert.equal((await f.browser('/api/get-constants', { cookie })).status, 401)
+  const bad = await f.browser('/api/login', {
+    cookie,
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'wrong-password' })
+  })
+  assert.equal(bad.status, 401)
+  const login = await f.browser('/api/login', {
+    cookie,
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'independent-web-password' })
+  })
+  assert.equal(login.status, 200)
+  assert.equal(login.body.toString(), jwt)
+  assert.ok(!login.headers['set-cookie'])
+  const headers = {
+    token: jwt,
+    'x-anubis-managed-role': 'administrator',
+    'x-anubis-managed-context': 'forged-selector',
+    'x-anubis-managed-auth': 'forged-proof'
+  }
+  assert.equal((await f.browser('/api/get-constants', { cookie, headers })).status, 200)
+  assert.equal(f.upstreamHeaders.at(-1).token, jwt)
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-role'], undefined)
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], undefined)
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-auth'], 'private-local-only')
+  assert.ok(!f.upstreamHeaders.at(-1).cookie?.includes('__Host-anubis-gateway'))
+  assert.equal((await f.browser('/api/get-constants?token=' + encodeURIComponent(jwt), { cookie })).status, 200)
+  assert.equal((await f.browser('/api/get-constants', { headers: { token: jwt } })).status, 401)
+  assert.equal((await f.browser('/api/get-constants', {
+    cookie, headers: { token: sign({ user: 'standalone-fixture', exp: 1 }) }
+  })).status, 401)
+  async function deniedSocket (query, cookieHeader) {
+    const socket = new WebSocket(f.base.replace('http:', 'ws:') + '/common/s' + query, {
+      headers: { host: new URL(ticket.url).host, ...(cookieHeader ? { cookie: cookieHeader } : {}) }
+    })
+    socket.on('error', () => {})
+    return new Promise((resolve, reject) => {
+      socket.once('open', () => { socket.terminate(); reject(new Error('JWT and gateway grant must both be required')) })
+      socket.once('unexpected-response', (request, response) => {
+        response.resume()
+        request.destroy()
+        resolve(response.statusCode)
+      })
+    })
+  }
+  assert.equal(await deniedSocket('', cookie), 502)
+  assert.equal(socketChecks.at(-1), false)
+  assert.equal(await deniedSocket('?token=' + encodeURIComponent(jwt)), 401)
+  const nativeLogin = await f.browser('/_anubis/login', {
+    cookie,
+    method: 'POST',
+    headers: { origin: new URL(ticket.url).origin, 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'administrator', password: administratorPassword })
+  })
+  assert.equal(nativeLogin.status, 409)
+  assert.match(nativeLogin.body.toString(), /standalone Web application/)
+  const socket = new WebSocket(f.base.replace('http:', 'ws:') + '/common/s?token=' + encodeURIComponent(jwt), {
+    headers: { host: new URL(ticket.url).host, cookie }
+  })
+  await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
+  socket.send('standalone Web authenticated stream')
+  assert.equal((await new Promise(resolve => socket.once('message', resolve))).toString(), 'standalone Web authenticated stream')
+  const closed = new Promise(resolve => socket.once('close', resolve))
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/revoke`, 'POST')).status, 200)
+  await closed
+  assert.equal((await f.browser('/api/get-constants', { cookie, headers: { token: jwt } })).status, 401)
+  assert.ok(!paths.some(value => value.startsWith('/api/managed-')))
+})
+
+test('standalone transport tickets and cookies cannot change application kind or outlive gateway expiry', async t => {
+  const f = await fixture(t, { app: 'anubis-web', sessionMs: 200 })
+  await approve(f)
+  const issue = async () => await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+  const exchange = ticket => f.browser('/_anubis/connect', {
+    method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
+  })
+  const first = await exchange(await issue())
+  const cookie = first.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await f.browser('/', { cookie })).status, 200)
+  await new Promise(resolve => setTimeout(resolve, 220))
+  assert.equal((await f.browser('/', { cookie })).status, 401)
+  const ticket = await issue()
+  const live = await exchange(await issue())
+  const liveCookie = live.headers['set-cookie'][0].split(';')[0]
+  const saved = JSON.parse(fs.readFileSync(path.join(f.dir, 'client.json'), 'utf8'))
+  assert.equal((await f.api('/api/agents/enroll', 'POST', { ...saved, app: 'anubis' }, false)).status, 200)
+  assert.equal((await exchange(ticket)).status, 401)
+  assert.equal((await f.browser('/', { cookie: liveCookie })).status, 401)
+  const desktop = await exchange(await issue())
+  const desktopCookie = desktop.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await f.browser('/api/get-constants', {
+    cookie: desktopCookie, headers: { 'x-anubis-app': 'anubis-web', token: 'pretend-jwt' }
+  })).status, 401)
+})
+
+test('unknown or lookalike application kinds never acquire standalone transport-only access', async t => {
+  for (const app of ['anubis-web-other', 'ANUBIS-WEB', '']) {
+    const f = await fixture(t, { app })
+    await approve(f)
+    const ticket = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+    const response = await f.browser('/_anubis/connect', {
+      method: 'POST', body: JSON.stringify({ ticket: ticket.ticket, app: 'anubis-web' })
+    })
+    const cookie = response.headers['set-cookie'][0].split(';')[0]
+    assert.equal((await f.browser('/api/get-constants', { cookie })).status, 401)
+  }
+})
 
 test('device URLs and administrator tickets require a workspace password before HTTP or WebSocket access', async t => {
   const f = await fixture(t)
