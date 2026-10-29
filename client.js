@@ -59,10 +59,11 @@ function createAgent (options) {
   let probing = false
   let state = 'offline'
   let url
+  let entitlement = { pro: false, proExpiresAt: null }
 
   function status (next, error) {
     state = next
-    onStatus({ id: saved.id, status: next, fingerprint, url: next === 'online' ? url : undefined, error })
+    onStatus({ id: saved.id, status: next, fingerprint, url: next === 'online' ? url : undefined, pro: entitlement.pro, proExpiresAt: entitlement.proExpiresAt, error })
   }
 
   function websocket (route) {
@@ -165,6 +166,10 @@ function createAgent (options) {
       if (enrollment.id !== saved.id || !['pending', 'approved', 'revoked'].includes(enrollment.status)) {
         throw new Error('Invalid managed enrollment response')
       }
+      entitlement = {
+        pro: enrollment.pro === true,
+        proExpiresAt: typeof enrollment.proExpiresAt === 'number' ? enrollment.proExpiresAt : null
+      }
       url = enrollment.url
       if (enrollment.status !== 'approved') {
         status(enrollment.status)
@@ -224,6 +229,24 @@ function createAgent (options) {
       for (const socket of sockets) socket.terminate()
       sockets.clear()
       status('offline')
+    },
+    async activate (key) {
+      if (typeof key !== 'string' || !key) return { ok: false, error: 'invalid' }
+      const response = await fetch(new URL('/api/agents/enroll', base), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        redirect: 'error',
+        signal: AbortSignal.timeout(10000),
+        body: JSON.stringify({ ...saved, label, app, version, platform: process.platform, arch: process.arch, activationKey: key })
+      })
+      if (!response.ok) throw new Error('Activation failed: HTTP ' + response.status)
+      const enrollment = await response.json()
+      entitlement = {
+        pro: enrollment.pro === true,
+        proExpiresAt: typeof enrollment.proExpiresAt === 'number' ? enrollment.proExpiresAt : null
+      }
+      status(state)
+      return enrollment.activation || { ok: entitlement.pro, proExpiresAt: entitlement.proExpiresAt }
     }
   }
 }
