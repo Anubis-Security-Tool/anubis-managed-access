@@ -51,6 +51,14 @@ function createGateway ({
     }
   }
   const agents = new Map(Object.entries(saved))
+  const settingsFile = path.join(dataDir, 'managed-settings.json')
+  const settings = { autoApprove: false }
+  try {
+    const rawSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+    if (rawSettings && typeof rawSettings === 'object') settings.autoApprove = rawSettings.autoApprove === true
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
   const webCredentials = createWebCredentials(dataDir)
   let administratorLogins = 0
   const controls = new Map()
@@ -67,6 +75,12 @@ function createGateway ({
     const next = file + '.next'
     fs.writeFileSync(next, JSON.stringify(Object.fromEntries(agents)), { mode: 0o600 })
     fs.renameSync(next, file)
+  }
+
+  function persistSettings () {
+    const next = settingsFile + '.next'
+    fs.writeFileSync(next, JSON.stringify({ autoApprove: settings.autoApprove }), { mode: 0o600 })
+    fs.renameSync(next, settingsFile)
   }
 
   function origin (id) {
@@ -645,7 +659,7 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
           if (agents.size >= maxAgents || quota.count >= 60) return json(res, 429, { error: 'Enrollment limit reached' })
           quota.count++
           registrations.set(ip, quota)
-          const value = { status: 'pending', fingerprint: digest(input.secret), createdAt: Date.now() }
+          const value = { status: settings.autoApprove ? 'approved' : 'pending', fingerprint: digest(input.secret), createdAt: Date.now() }
           for (const field of ['label', 'app', 'version', 'platform', 'arch']) {
             value[field] = typeof input[field] === 'string' ? input[field].slice(0, 128) : ''
           }
@@ -670,6 +684,21 @@ document.getElementById('login').addEventListener('submit',async event=>{event.p
         })
       }
       if (!isAdmin(req)) return json(res, 401, { error: 'unauthorized' })
+      if (url.pathname === '/api/agents/settings') {
+        if (req.method === 'GET') return json(res, 200, { autoApprove: settings.autoApprove })
+        if (req.method === 'POST') {
+          const input = await body(req)
+          if (!input || typeof input !== 'object' || Array.isArray(input) ||
+              Object.keys(input).join(',') !== 'autoApprove' || typeof input.autoApprove !== 'boolean') {
+            return json(res, 400, { error: 'Exactly one boolean field autoApprove required' })
+          }
+          const previous = settings.autoApprove
+          settings.autoApprove = input.autoApprove
+          try { persistSettings() } catch (error) { settings.autoApprove = previous; throw error }
+          return json(res, 200, { autoApprove: settings.autoApprove })
+        }
+        return json(res, 405, { error: 'Method not allowed' })
+      }
       if (url.pathname === '/api/agents' && req.method === 'GET') {
         return json(res, 200, { agents: [...agents].map(([id, value]) => publicAgent(id, value)) })
       }
