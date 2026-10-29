@@ -152,12 +152,15 @@ module.exports = {
   script: '(' + contextUi.toString() + ')();',
   style: `
 #anubis-context-controls {
-  position: fixed; inset: 0 0 auto 0; z-index: 10000; min-height: 42px;
-  display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+  position: fixed; top: 0; right: 0; left: auto; z-index: 10000; min-height: 42px;
+  max-width: calc(100vw - 240px);
+  display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 6px 12px;
   box-sizing: border-box; color: var(--text, #e6edf3); background: var(--main, #17191d);
-  border-bottom: 1px solid var(--border, var(--ui-border, #475366)); font: 12px system-ui, sans-serif;
+  border-left: 1px solid var(--border, var(--ui-border, #475366));
+  border-bottom: 1px solid var(--border, var(--ui-border, #475366));
+  border-bottom-left-radius: 10px; font: 12px system-ui, sans-serif;
 }
-#anubis-context-controls select { max-width: 48vw; }
+#anubis-context-controls select { max-width: 32vw; }
 #anubis-context-controls select, #anubis-context-controls button {
   color: inherit; background: var(--main, #17191d);
   border: 1px solid var(--border, var(--ui-border, #475366));
@@ -170,11 +173,14 @@ module.exports = {
 #anubis-context-controls select:disabled, #anubis-context-controls button:disabled {
   color: var(--text-disabled, #94a3b8); cursor: not-allowed;
 }
-#anubis-context-controls [role="status"] { overflow-wrap: anywhere; }
+#anubis-context-controls [role="status"] { overflow-wrap: anywhere; max-width: 24vw; }
 body.anubis-managed-contexts #container { margin-top: 54px; height: calc(100vh - 54px); }
-@media (max-width: 700px) {
-  #anubis-context-controls { flex-wrap: wrap; }
+@media (max-width: 900px) {
+  #anubis-context-controls { max-width: calc(100vw - 48px); }
   #anubis-context-controls [role="status"] { display: none; }
+}
+@media (max-width: 700px) {
+  #anubis-context-controls { flex-wrap: wrap; max-width: 100vw; left: 0; border-bottom-left-radius: 0; }
   #anubis-context-controls select { max-width: 65vw; }
 }
 `
